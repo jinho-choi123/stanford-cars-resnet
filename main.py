@@ -86,12 +86,12 @@ def test_collate_fn(samples):
 class CNN_Classifier(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=5, padding='same')
-        self.conv2 = nn.Conv2d(in_channels=64, out_channels=256, kernel_size=5, padding='same')
-        self.conv3 = nn.Conv2d(in_channels=256, out_channels=64, kernel_size=5, padding='same')
-        self.fc1 = nn.Linear(64*(IMG_SIZE // 2^3)*(IMG_SIZE // 2^3), 7840)
-        self.fc2 = nn.Linear(7840, 784)
-        self.fc3 = nn.Linear(784, 196)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=8, kernel_size=5, padding='same')
+        self.conv2 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=5, padding='same')
+        self.conv3 = nn.Conv2d(in_channels=16, out_channels=16, kernel_size=5, padding='same')
+        self.fc1 = nn.Linear(16*(IMG_SIZE // 2^3)*(IMG_SIZE // 2^3), 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 196)
         self.pool = nn.MaxPool2d(kernel_size=2)
 
     def forward(self, x):
