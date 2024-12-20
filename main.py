@@ -23,7 +23,7 @@ config = {
         "dataset": "Stanford Cars",
         "huggingface-dataset-repo-id": "tanganke/stanford_cars",
         "huggingface-model-repo-id": "ball1433/ResNet-Stanford-Cars",
-        "accumulate_grad_batches": 8,
+        "accumulate_grad_batches": 1,
         "val_check_interval": 1.0,
         "gradient_clip_val": 1.0,
         "deterministic": True,
