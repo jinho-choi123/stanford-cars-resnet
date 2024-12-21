@@ -8,33 +8,41 @@ import lightning as L
 from datetime import datetime
 from lightning.pytorch.loggers import WandbLogger
 import wandb
-from lightning.pytorch.callbacks import Callback, ModelSummary
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from torch.utils.data import DataLoader, Dataset
-
+from huggingface_hub import PyTorchModelHubMixin
 
 IMG_SIZE = 224
 
 config = {
-        "batch_size": 1,
+        "batch_size": 64,
         "lr": 3e-4, 
         "epochs": 100, 
         "architecture": "CNN", 
         "dataset": "Stanford Cars",
         "huggingface-dataset-repo-id": "tanganke/stanford_cars",
-        "huggingface-model-repo-id": "ball1433/ResNet-Stanford-Cars",
-        "accumulate_grad_batches": 1,
+        "accumulate_grad_batches": 4,
         "val_check_interval": 1.0,
         "gradient_clip_val": 1.0,
         "deterministic": True,
         "summary_depth": 3,
-        "num_workers": 1,
+        # "num_workers": 3,
+        "pin_memory": True,
+        "model_store_path": "models/", 
+        "model_save_top_k": 3,
+        "model_save_monitor_metric": "validation/loss",
+        "model_save_huggingface_repo_id": "ball1433/stanford-cars-resnet",
+        "load_model_before_training": False, # load the pre-trained model from the model_save_huggingface_repo_id
 }
 
 # define a wandb logger
-wandb_logger = WandbLogger(project="resnet-stanford-cars", name=f"experiment-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-wandb.init()
-wandb.config.update(config)
+wandb.init(project="resnet-stanford-cars", name=f"experiment-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", config=config)
+wandb_logger = WandbLogger()
+dataset_artifact = wandb.Artifact(name="stanford-cars-dataset", type="dataset")
+model_artifact = wandb.Artifact(name="resnet-stanford-cars-model", type="model")
+
+
 
 # install stanford cars dataset
 train_dataset = load_dataset(config.get("huggingface-dataset-repo-id", "tanganke/stanford_cars"), split="train")
@@ -45,13 +53,13 @@ test_dataset = load_dataset(config.get("huggingface-dataset-repo-id", "tanganke/
 # check if image is rgb. if not, convert to rgb
 # add some variation to make the model robust
 train_transform = transforms.Compose([
-    transforms.Resize(size=IMG_SIZE),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
 
 test_transform = transforms.Compose([
-    transforms.Resize(size=IMG_SIZE),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
@@ -61,11 +69,14 @@ def train_collate_fn(samples):
     for image in [sample["image"] for sample in samples]:
         # convert to rgb if not.
         if image.mode != "RGB":
-            images.append(image.convert("RGB"))
+            image = image.convert("RGB")
         image = train_transform(image)
         images.append(image)
 
-    labels = [sample["label"] for sample in samples]
+    images = torch.stack(images)
+
+    labels = [torch.tensor(sample["label"]) for sample in samples]
+    labels = torch.stack(labels)
 
     return images, labels
 
@@ -73,26 +84,30 @@ def test_collate_fn(samples):
     images = []
     for image in [sample["image"] for sample in samples]:
         if image.mode != "RGB":
-            images.append(image.convert("RGB"))
+            image = image.convert("RGB")
 
         image = test_transform(image)
         images.append(image)
 
-    labels = [sample["label"] for sample in samples]
+    images = torch.stack(images)
+
+    labels = [torch.tensor(sample["label"]) for sample in samples]
+    labels = torch.stack(labels)
+
 
     return images, labels
 
 
-class CNN_Classifier(nn.Module):
+class CNN_Classifier(nn.Module, PyTorchModelHubMixin):
     def __init__(self):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=8, kernel_size=5, padding='same')
         self.conv2 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=5, padding='same')
         self.conv3 = nn.Conv2d(in_channels=16, out_channels=16, kernel_size=5, padding='same')
-        self.fc1 = nn.Linear(16*(IMG_SIZE // 2^3)*(IMG_SIZE // 2^3), 512)
+        self.fc1 = nn.Linear(16*(IMG_SIZE // 8)*(IMG_SIZE // 8), 512)
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, 196)
-        self.pool = nn.MaxPool2d(kernel_size=2)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
@@ -129,16 +144,25 @@ class Lit_CNN_Classifier(L.LightningModule):
         val_loss = self.loss(outputs, labels)
         self.log("validation/loss", val_loss, on_epoch=True)
 
-        predictions = torch.max(outputs, dim=1)
+        _, predictions = torch.max(outputs, dim=1)
+
         # calculate the accuracy
         correct_cnt = 0
         total_cnt = 0
-        for label, prediction in zip(labels, predictions):
+
+        columns = ["image", "prediction", "label"]
+        data = []
+        for image, label, prediction in zip(images, labels, predictions):
             if label == prediction:
                 total_cnt += 1
                 correct_cnt += 1
             else:
                 total_cnt += 1
+
+            data.append([wandb.Image(image), prediction, label])
+        wandb_logger.log_table(key="validation/visualization", columns=columns, data=data)
+
+            
         val_acc = correct_cnt / total_cnt
         self.log("validation/accuracy", val_acc, on_epoch=True)
 
@@ -149,25 +173,29 @@ class Lit_CNN_Classifier(L.LightningModule):
         return optimizer
 
     def train_dataloader(self):
-        return DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, collate_fn=train_collate_fn, num_workers=self.config.get("num_workers", 1))
+        # return DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, collate_fn=train_collate_fn, num_workers=self.config.get("num_workers", 1), pin_memory=self.config.get("pin_memory", False))
+        return DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, collate_fn=train_collate_fn, pin_memory=self.config.get("pin_memory", False))
+
 
     def val_dataloader(self):
-        return DataLoader(test_dataset, batch_size=self.batch_size, collate_fn=test_collate_fn, num_workers=self.config.get("num_workers", 1))
+        # return DataLoader(test_dataset, batch_size=self.batch_size, collate_fn=test_collate_fn, num_workers=self.config.get("num_workers", 1), pin_memory=self.config.get("pin_memory", False))
+        return DataLoader(test_dataset, batch_size=self.batch_size, collate_fn=test_collate_fn, pin_memory=self.config.get("pin_memory", False))
+
 
 
 # Define callbacks
 class PushToHubCallback(Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         print(f"Pushing the model to the hub, epoch {trainer.current_epoch}")
-        pl_module.model.push_to_hub(config.get("huggingface-model-repo-id"), 
-                                    commit_mesage=f"Training in progress, epoch {trainer.current_epoch}")
+        pl_module.model.push_to_hub(config.get("model_save_huggingface_repo_id"))
 
     def on_train_end(self, trainer, pl_module):
         print(f"Pushing the model to the hub after training is done")
-        pl_module.model.push_to_hub(config.get("huggingface-model-repo-id"), commit_message="Training done")
+        pl_module.model.push_to_hub(config.get("model_save_huggingface_repo_id"))
 
 early_stop_callback = EarlyStopping(monitor="validation/accuracy", patience=10, verbose=False, mode="max")
-model_summary_callback = ModelSummary(max_depth=config.get("summary_depth", 3))
+
+checkpoint_callback = ModelCheckpoint(dirpath="models/", save_top_k=3, monitor="validation/loss", filename='{epoch}-{val_loss:.2f}', save_on_train_epoch_end=True)
 
 # define a Trainer
 trainer = L.Trainer(
@@ -176,7 +204,7 @@ trainer = L.Trainer(
     val_check_interval=config.get("val_check_interval", 1.0),
     gradient_clip_val=config.get("gradient_clip_val", 1.0),
     num_sanity_val_steps=5,
-    callbacks=[PushToHubCallback(), early_stop_callback, model_summary_callback],
+    callbacks=[PushToHubCallback(), early_stop_callback],
     deterministic=config.get("deterministic", True),
     logger=wandb_logger,
 )
